@@ -1,24 +1,62 @@
+from dotenv import load_dotenv
 import os
 import json
-from datetime import datetime
 import csv
+from datetime import datetime
 from collections import defaultdict
 import ijson
+import argparse
 
 
 def parse_date(date_str):
     """Parse date string into datetime object."""
-    try:
-        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-    except (ValueError, AttributeError):
+    if not date_str or not isinstance(date_str, str):
+        return None
+
+    date_str = date_str.strip()
+
+    if date_str.isdigit() and len(date_str) == 4:
         try:
-            return datetime.strptime(date_str, '%Y-%m-%d')
-        except (ValueError, AttributeError):
-            print(f"Attention: Impossible de parser la date: {date_str}")
-            return None
+            year = int(date_str)
+            if 1900 <= year <= 2100:
+                return datetime(year, 1, 1)
+        except ValueError:
+            pass
+
+    # Formats à essayer dans l'ordre
+    formats = [
+        # Format ISO (avec ou sans timezone)
+        lambda d: datetime.fromisoformat(d.replace('Z', '+00:00')) if 'T' in d else None,
+        # Format standard YYYY-MM-DD
+        lambda d: datetime.strptime(d, '%Y-%m-%d'),
+        # Format en anglais: "Jan 5, 2004", "January 5, 2004"
+        lambda d: datetime.strptime(d, '%b %d, %Y'),
+        lambda d: datetime.strptime(d, '%B %d, %Y'),
+        # Format sans virgule: "Jan 5 2004", "January 5 2004"
+        lambda d: datetime.strptime(d, '%b %d %Y'),
+        lambda d: datetime.strptime(d, '%B %d %Y'),
+        # Format américain MM/DD/YYYY
+        lambda d: datetime.strptime(d, '%m/%d/%Y'),
+        # Format européen DD/MM/YYYY
+        lambda d: datetime.strptime(d, '%d/%m/%Y'),
+        # Format avec tirets DD-MM-YYYY
+        lambda d: datetime.strptime(d, '%d-%m-%Y'),
+    ]
+
+    for format_parser in formats:
+        try:
+            date = format_parser(date_str)
+            if not date:
+                continue
+            return date
+        except (ValueError, TypeError):
+            continue
+
+    print(f"Attention: Impossible de parser la date: {date_str}")
+    return None
 
 
-def sort_json_by_year(input_file, output_directory):
+def sort_json_by_year(input_file, output_directory, date_columns_name=None):
     """
     Trie les emplois par année depuis un fichier JSON via streaming.
     """
@@ -32,26 +70,32 @@ def sort_json_by_year(input_file, output_directory):
         with open(input_file, 'r', encoding='utf-8') as f:
             jobs = ijson.items(f, 'jobs.item')
 
+            date_word = date_columns_name if date_columns_name else ['year', 'date', 'created', 'posted', 'publish']
+
             for job in jobs:
-                date_field = 'date_creation' if 'date_creation' in job else 'last_seen'
-                if date_field not in job:
-                    date_field = 'Job Posting Date'
+                date_field = None
+                for date_term in date_word:
+                    if date_term in job:
+                        date_field = date_term
+                        break
+                if not date_field:
+                    print(f"Attention: Impossible de trouver une colonne de date dans le fichier JSON {input_file}")
+                    return {}
 
-                if date_field in job:
-                    date = parse_date(job[date_field])
-                    if date:
-                        year = date.year
-                        job_counts[year] += 1
+                date = parse_date(job[date_field])
+                if date:
+                    year = date.year
+                    job_counts[year] += 1
 
-                        if year not in temp_files:
-                            temp_file_path = os.path.join(output_directory, f"{filename_base}_{year}_temp.json")
-                            temp_files[year] = open(temp_file_path, 'w', encoding='utf-8')
-                            temp_files[year].write('{"jobs": [')
-                        else:
-                            if job_counts[year] > 1:
-                                temp_files[year].write(',')
+                    if year not in temp_files:
+                        temp_file_path = os.path.join(output_directory, f"{filename_base}_{year}_temp.json")
+                        temp_files[year] = open(temp_file_path, 'w', encoding='utf-8')
+                        temp_files[year].write('{"jobs": [')
+                    else:
+                        if job_counts[year] > 1:
+                            temp_files[year].write(',')
 
-                        json.dump(job, temp_files[year], ensure_ascii=False)
+                    json.dump(job, temp_files[year], ensure_ascii=False)
 
         for year, temp_file in temp_files.items():
             temp_file.write(']}')
@@ -80,10 +124,11 @@ def sort_json_by_year(input_file, output_directory):
     return dict(job_counts)
 
 
-def sort_csv_by_year(input_file, output_directory):
+def sort_csv_by_year(input_file, output_directory, date_columns_name=None):
     """
     Trie les emplois par année depuis un fichier CSV via streaming.
     """
+    print(output_directory)
     os.makedirs(output_directory, exist_ok=True)
     filename_base = os.path.splitext(os.path.basename(input_file))[0]
 
@@ -92,14 +137,15 @@ def sort_csv_by_year(input_file, output_directory):
     job_counts = defaultdict(int)
 
     try:
-        with open(input_file, 'r', encoding='utf-8', newline='') as csvfile:
-            # Lire le header
+        with open(input_file, 'r', encoding='utf-8', newline='', errors='replace') as csvfile:
             reader = csv.reader(csvfile)
             header = next(reader)
 
+            date_word = date_columns_name if date_columns_name else ['date', 'created', 'posted', 'publish']
+
             date_column_index = None
             for i, col_name in enumerate(header):
-                if any(date_term in col_name.lower() for date_term in ['date', 'created', 'posted', 'publish']):
+                if any(date_term in col_name.lower() for date_term in date_word):
                     date_column_index = i
                     print(f"Utilisation de la colonne '{col_name}' pour les informations de date")
                     break
@@ -122,7 +168,7 @@ def sort_csv_by_year(input_file, output_directory):
                     if year not in csv_writers:
                         output_file = os.path.join(output_directory, f"{filename_base}_{year}.csv")
                         csv_files[year] = open(output_file, 'w', encoding='utf-8', newline='')
-                        csv_writers[year] = csv.writer(csv_files[year], quoting=csv.QUOTE_NONNUMERIC)
+                        csv_writers[year] = csv.writer(csv_files[year], quoting=csv.QUOTE_MINIMAL)
                         csv_writers[year].writerow(header)
 
                     csv_writers[year].writerow(row)
@@ -142,7 +188,7 @@ def sort_csv_by_year(input_file, output_directory):
     return dict(job_counts)
 
 
-def process_directory(input_directory, output_directory):
+def process_directory(input_directory, output_directory, date_columns_name=None):
     """
     Traite tous les fichiers JSON et CSV dans un répertoire.
     """
@@ -161,9 +207,9 @@ def process_directory(input_directory, output_directory):
         print(f"Traitement de {filepath}...")
 
         if file_ext == '.json':
-            result = sort_json_by_year(filepath, output_directory)
+            result = sort_json_by_year(filepath, output_directory, date_columns_name)
         elif file_ext == '.csv':
-            result = sort_csv_by_year(filepath, output_directory)
+            result = sort_csv_by_year(filepath, output_directory, date_columns_name)
 
         if result:
             stats[filename] = result
@@ -175,7 +221,7 @@ def process_directory(input_directory, output_directory):
             print(f"    {year}: {count} emplois")
 
 
-def process_single_file(input_file, output_directory):
+def process_single_file(input_file, output_directory, date_columns_name=None):
     """
     Traite un seul fichier (pour les très gros fichiers).
     """
@@ -187,32 +233,34 @@ def process_single_file(input_file, output_directory):
 
     file_ext = os.path.splitext(input_file)[1].lower()
     if file_ext == '.json':
-        sort_json_by_year(input_file, output_directory)
+        sort_json_by_year(input_file, output_directory, date_columns_name)
     elif file_ext == '.csv':
-        sort_csv_by_year(input_file, output_directory)
+        sort_csv_by_year(input_file, output_directory, date_columns_name)
     else:
         print(f"Format de fichier non supporté: {file_ext}")
 
 
 if __name__ == "__main__":
-    import os
-    import argparse
-    from dotenv import load_dotenv
-
     load_dotenv()
 
     parser = argparse.ArgumentParser(description='Trier les offres d\'emploi par année')
     parser.add_argument('--input', '-i', help='Fichier d\'entrée ou répertoire')
+    parser.add_argument('--date_column-name', '-d', help='Nom de la colonne de date')
     parser.add_argument('--output', '-o', help='Répertoire de sortie')
     args = parser.parse_args()
 
     input_path = args.input or os.getenv("DIRECTORY_PATH")
+    date_cols_name = args.date_column_name or os.getenv("DATE_COLUMN_NAME")
+    if date_cols_name:
+        date_cols_name = date_cols_name.split(',')
+    else:
+        date_cols_name = None
     output_dir = args.output or os.getenv("SORTED_DIRECTORY_PATH")
 
     print(f"Chemin d'entrée: {input_path}")
     print(f"Répertoire de sortie: {output_dir}")
 
     if os.path.isdir(input_path):
-        process_directory(input_path, output_dir)
+        process_directory(input_path, output_dir, date_cols_name)
     else:
-        process_single_file(input_path, output_dir)
+        process_single_file(input_path, output_dir, date_cols_name)
